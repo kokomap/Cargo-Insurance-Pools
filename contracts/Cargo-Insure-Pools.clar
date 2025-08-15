@@ -66,6 +66,19 @@
   uint
 )
 
+(define-map pool-analytics
+  uint
+  {
+    total-claims: uint,
+    approved-claims: uint,
+    rejected-claims: uint,
+    total-claims-amount: uint,
+    total-payouts: uint,
+    avg-processing-time: uint,
+    last-updated: uint
+  }
+)
+
 (define-private (get-pool-balance (pool-id uint))
   (default-to u0 (get total-pool (map-get? pools pool-id)))
 )
@@ -103,6 +116,21 @@
   (var-get platform-fee)
 )
 
+(define-read-only (get-pool-analytics (pool-id uint))
+  (default-to 
+    {
+      total-claims: u0,
+      approved-claims: u0,
+      rejected-claims: u0,
+      total-claims-amount: u0,
+      total-payouts: u0,
+      avg-processing-time: u0,
+      last-updated: u0
+    }
+    (map-get? pool-analytics pool-id)
+  )
+)
+
 (define-public (create-pool (route (string-ascii 100)) (max-pool uint) (min-contribution uint) (max-contribution uint) (premium-rate uint))
   (let ((pool-id (+ (var-get pool-counter) u1)))
     (asserts! (> max-pool u0) ERR-INVALID-AMOUNT)
@@ -120,6 +148,16 @@
       premium-rate: premium-rate,
       active: true,
       created-at: stacks-block-height
+    })
+    
+    (map-set pool-analytics pool-id {
+      total-claims: u0,
+      approved-claims: u0,
+      rejected-claims: u0,
+      total-claims-amount: u0,
+      total-payouts: u0,
+      avg-processing-time: u0,
+      last-updated: stacks-block-height
     })
     
     (var-set pool-counter pool-id)
@@ -193,6 +231,14 @@
       voting-deadline: (+ stacks-block-height u144)
     })
     
+    (let ((current-analytics (get-pool-analytics pool-id)))
+      (map-set pool-analytics pool-id (merge current-analytics {
+        total-claims: (+ (get total-claims current-analytics) u1),
+        total-claims-amount: (+ (get total-claims-amount current-analytics) amount),
+        last-updated: stacks-block-height
+      }))
+    )
+    
     (var-set claim-counter claim-id)
     (ok claim-id)
   )
@@ -255,10 +301,29 @@
           (map-set user-balances (var-get contract-owner) (+ owner-balance platform-fee-amount))
         )
         
+        (let ((current-analytics (get-pool-analytics pool-id))
+              (processing-time (- stacks-block-height (get created-at claim-info))))
+          (map-set pool-analytics pool-id (merge current-analytics {
+            approved-claims: (+ (get approved-claims current-analytics) u1),
+            total-payouts: (+ (get total-payouts current-analytics) payout-amount),
+            avg-processing-time: (/ (+ (* (get avg-processing-time current-analytics) (get approved-claims current-analytics)) processing-time) 
+                                   (+ (get approved-claims current-analytics) u1)),
+            last-updated: stacks-block-height
+          }))
+        )
+        
         (ok true)
       )
       (begin
         (map-set claims claim-id (merge claim-info {status: "rejected"}))
+        
+        (let ((current-analytics (get-pool-analytics pool-id)))
+          (map-set pool-analytics pool-id (merge current-analytics {
+            rejected-claims: (+ (get rejected-claims current-analytics) u1),
+            last-updated: stacks-block-height
+          }))
+        )
+        
         (ok false)
       )
     )
