@@ -9,6 +9,8 @@
 (define-constant ERR-INSUFFICIENT-POOL-BALANCE (err u108))
 (define-constant ERR-ALREADY-CONTRIBUTED (err u109))
 (define-constant ERR-POOL-FULL (err u110))
+(define-constant ERR-NO-REWARDS (err u111))
+(define-constant ERR-REWARDS-ALREADY-CLAIMED (err u112))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var pool-counter uint u0)
@@ -79,6 +81,25 @@
   }
 )
 
+(define-map pool-rewards
+  uint
+  {
+    total-premium-collected: uint,
+    total-rewards-distributed: uint,
+    reward-rate: uint,
+    last-distribution: uint
+  }
+)
+
+(define-map contributor-rewards
+  {pool-id: uint, contributor: principal}
+  {
+    total-earned: uint,
+    last-claimed: uint,
+    pending-rewards: uint
+  }
+)
+
 (define-private (get-pool-balance (pool-id uint))
   (default-to u0 (get total-pool (map-get? pools pool-id)))
 )
@@ -98,6 +119,46 @@
 
 (define-private (is-pool-contributor (pool-id uint) (user principal))
   (is-some (map-get? pool-contributors {pool-id: pool-id, contributor: user}))
+)
+
+(define-private (get-pool-rewards (pool-id uint))
+  (default-to 
+    {
+      total-premium-collected: u0,
+      total-rewards-distributed: u0,
+      reward-rate: u500,
+      last-distribution: u0
+    }
+    (map-get? pool-rewards pool-id)
+  )
+)
+
+(define-private (calculate-contributor-share (pool-id uint) (contributor principal))
+  (let ((pool-info (unwrap-panic (map-get? pools pool-id)))
+        (contributor-info (unwrap-panic (map-get? pool-contributors {pool-id: pool-id, contributor: contributor}))))
+    (if (> (get total-pool pool-info) u0)
+      (/ (* (get amount contributor-info) u10000) (get total-pool pool-info))
+      u0
+    )
+  )
+)
+
+(define-private (calculate-pending-rewards (pool-id uint) (contributor principal))
+  (let ((pool-rewards-info (get-pool-rewards pool-id))
+        (contributor-share (calculate-contributor-share pool-id contributor))
+        (contributor-rewards-info (map-get? contributor-rewards {pool-id: pool-id, contributor: contributor})))
+    (match contributor-rewards-info
+      existing-rewards
+        (let ((share-of-unclaimed (/ (* (get total-premium-collected pool-rewards-info) contributor-share) u10000))
+              (already-earned (get total-earned existing-rewards)))
+          (if (> share-of-unclaimed already-earned)
+            (- share-of-unclaimed already-earned)
+            u0
+          )
+        )
+      (/ (* (get total-premium-collected pool-rewards-info) contributor-share) u10000)
+    )
+  )
 )
 
 (define-read-only (get-pool-info (pool-id uint))
@@ -131,6 +192,21 @@
   )
 )
 
+(define-read-only (get-contributor-rewards (pool-id uint) (contributor principal))
+  (map-get? contributor-rewards {pool-id: pool-id, contributor: contributor})
+)
+
+(define-read-only (get-pending-rewards (pool-id uint) (contributor principal))
+  (if (is-pool-contributor pool-id contributor)
+    (calculate-pending-rewards pool-id contributor)
+    u0
+  )
+)
+
+(define-read-only (get-pool-rewards-info (pool-id uint))
+  (get-pool-rewards pool-id)
+)
+
 (define-public (create-pool (route (string-ascii 100)) (max-pool uint) (min-contribution uint) (max-contribution uint) (premium-rate uint))
   (let ((pool-id (+ (var-get pool-counter) u1)))
     (asserts! (> max-pool u0) ERR-INVALID-AMOUNT)
@@ -160,6 +236,13 @@
       last-updated: stacks-block-height
     })
     
+    (map-set pool-rewards pool-id {
+      total-premium-collected: u0,
+      total-rewards-distributed: u0,
+      reward-rate: u500,
+      last-distribution: stacks-block-height
+    })
+    
     (var-set pool-counter pool-id)
     (ok pool-id)
   )
@@ -185,6 +268,12 @@
     (map-set pools pool-id (merge pool-info {
       total-pool: (+ (get total-pool pool-info) amount)
     }))
+    
+    (map-set contributor-rewards {pool-id: pool-id, contributor: tx-sender} {
+      total-earned: u0,
+      last-claimed: stacks-block-height,
+      pending-rewards: u0
+    })
     
     (map-set user-balances tx-sender (- user-balance amount))
     (ok true)
@@ -343,6 +432,72 @@
   (let ((pool-info (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND)))
     (asserts! (is-eq tx-sender (get creator pool-info)) ERR-NOT-AUTHORIZED)
     (map-set pools pool-id (merge pool-info {active: false}))
+    (ok true)
+  )
+)
+
+(define-public (distribute-premiums (pool-id uint) (premium-amount uint))
+  (let ((pool-info (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+        (pool-rewards-info (get-pool-rewards pool-id)))
+    
+    (asserts! (is-eq tx-sender (get creator pool-info)) ERR-NOT-AUTHORIZED)
+    (asserts! (> premium-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (get active pool-info) ERR-NOT-AUTHORIZED)
+    
+    (map-set pool-rewards pool-id (merge pool-rewards-info {
+      total-premium-collected: (+ (get total-premium-collected pool-rewards-info) premium-amount),
+      last-distribution: stacks-block-height
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-rewards (pool-id uint))
+  (let ((pool-info (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+        (pending-rewards (calculate-pending-rewards pool-id tx-sender))
+        (user-balance (get-user-balance tx-sender))
+        (current-rewards (map-get? contributor-rewards {pool-id: pool-id, contributor: tx-sender})))
+    
+    (asserts! (is-pool-contributor pool-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (> pending-rewards u0) ERR-NO-REWARDS)
+    
+    (match current-rewards
+      existing-rewards
+        (map-set contributor-rewards {pool-id: pool-id, contributor: tx-sender} (merge existing-rewards {
+          total-earned: (+ (get total-earned existing-rewards) pending-rewards),
+          last-claimed: stacks-block-height,
+          pending-rewards: u0
+        }))
+      (map-set contributor-rewards {pool-id: pool-id, contributor: tx-sender} {
+        total-earned: pending-rewards,
+        last-claimed: stacks-block-height,
+        pending-rewards: u0
+      })
+    )
+    
+    (let ((pool-rewards-info (get-pool-rewards pool-id)))
+      (map-set pool-rewards pool-id (merge pool-rewards-info {
+        total-rewards-distributed: (+ (get total-rewards-distributed pool-rewards-info) pending-rewards)
+      }))
+    )
+    
+    (map-set user-balances tx-sender (+ user-balance pending-rewards))
+    (ok pending-rewards)
+  )
+)
+
+(define-public (set-reward-rate (pool-id uint) (new-rate uint))
+  (let ((pool-info (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+        (pool-rewards-info (get-pool-rewards pool-id)))
+    
+    (asserts! (is-eq tx-sender (get creator pool-info)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-rate u5000) ERR-INVALID-AMOUNT)
+    
+    (map-set pool-rewards pool-id (merge pool-rewards-info {
+      reward-rate: new-rate
+    }))
+    
     (ok true)
   )
 )
