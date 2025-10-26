@@ -11,6 +11,8 @@
 (define-constant ERR-POOL-FULL (err u110))
 (define-constant ERR-NO-REWARDS (err u111))
 (define-constant ERR-REWARDS-ALREADY-CLAIMED (err u112))
+(define-constant ERR-NOT-CONTRIBUTOR (err u113))
+(define-constant ERR-EXCEEDS-MAX-CONTRIBUTION (err u114))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var pool-counter uint u0)
@@ -499,5 +501,54 @@
     }))
     
     (ok true)
+  )
+)
+
+(define-public (increase-contribution (pool-id uint) (additional-amount uint))
+  (let ((pool-info (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+        (contributor-info (unwrap! (map-get? pool-contributors {pool-id: pool-id, contributor: tx-sender}) ERR-NOT-CONTRIBUTOR))
+        (user-balance (get-user-balance tx-sender))
+        (new-total-contribution (+ (get amount contributor-info) additional-amount)))
+    
+    (asserts! (get active pool-info) ERR-NOT-AUTHORIZED)
+    (asserts! (> additional-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= user-balance additional-amount) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (<= new-total-contribution (get max-contribution pool-info)) ERR-EXCEEDS-MAX-CONTRIBUTION)
+    (asserts! (<= (+ (get total-pool pool-info) additional-amount) (get max-pool pool-info)) ERR-POOL-FULL)
+    
+    (map-set pool-contributors {pool-id: pool-id, contributor: tx-sender} (merge contributor-info {
+      amount: new-total-contribution
+    }))
+    
+    (map-set pools pool-id (merge pool-info {
+      total-pool: (+ (get total-pool pool-info) additional-amount)
+    }))
+    
+    (map-set user-balances tx-sender (- user-balance additional-amount))
+    (ok new-total-contribution)
+  )
+)
+
+(define-public (decrease-contribution (pool-id uint) (reduction-amount uint))
+  (let ((pool-info (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+        (contributor-info (unwrap! (map-get? pool-contributors {pool-id: pool-id, contributor: tx-sender}) ERR-NOT-CONTRIBUTOR))
+        (user-balance (get-user-balance tx-sender))
+        (new-contribution (- (get amount contributor-info) reduction-amount)))
+    
+    (asserts! (get active pool-info) ERR-NOT-AUTHORIZED)
+    (asserts! (> reduction-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= (get amount contributor-info) reduction-amount) ERR-INVALID-AMOUNT)
+    (asserts! (>= new-contribution (get min-contribution pool-info)) ERR-INVALID-AMOUNT)
+    
+    (map-set pool-contributors {pool-id: pool-id, contributor: tx-sender} (merge contributor-info {
+      amount: new-contribution
+    }))
+    
+    (map-set pools pool-id (merge pool-info {
+      total-pool: (- (get total-pool pool-info) reduction-amount)
+    }))
+    
+    (map-set user-balances tx-sender (+ user-balance reduction-amount))
+    (ok new-contribution)
   )
 )
