@@ -13,6 +13,10 @@
 (define-constant ERR-REWARDS-ALREADY-CLAIMED (err u112))
 (define-constant ERR-NOT-CONTRIBUTOR (err u113))
 (define-constant ERR-EXCEEDS-MAX-CONTRIBUTION (err u114))
+(define-constant ERR-EMERGENCY-COOLDOWN (err u115))
+(define-constant ERR-POOL-NOT-IN-EMERGENCY (err u116))
+(define-constant EMERGENCY-WITHDRAWAL-PENALTY u1000)
+(define-constant EMERGENCY-COOLDOWN-BLOCKS u72)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var pool-counter uint u0)
@@ -99,6 +103,25 @@
     total-earned: uint,
     last-claimed: uint,
     pending-rewards: uint
+  }
+)
+
+(define-map pool-emergency-status
+  uint
+  {
+    is-emergency: bool,
+    declared-at: uint,
+    declared-by: principal,
+    reason: (string-ascii 100)
+  }
+)
+
+(define-map emergency-withdrawals
+  {pool-id: uint, contributor: principal}
+  {
+    last-withdrawal: uint,
+    total-withdrawn: uint,
+    penalty-paid: uint
   }
 )
 
@@ -207,6 +230,36 @@
 
 (define-read-only (get-pool-rewards-info (pool-id uint))
   (get-pool-rewards pool-id)
+)
+
+(define-read-only (get-pool-emergency-status (pool-id uint))
+  (default-to 
+    {
+      is-emergency: false,
+      declared-at: u0,
+      declared-by: tx-sender,
+      reason: ""
+    }
+    (map-get? pool-emergency-status pool-id)
+  )
+)
+
+(define-read-only (get-emergency-withdrawal-info (pool-id uint) (contributor principal))
+  (map-get? emergency-withdrawals {pool-id: pool-id, contributor: contributor})
+)
+
+(define-read-only (can-emergency-withdraw (pool-id uint) (contributor principal))
+  (let ((emergency-status (get-pool-emergency-status pool-id))
+        (withdrawal-info (map-get? emergency-withdrawals {pool-id: pool-id, contributor: contributor})))
+    (and 
+      (get is-emergency emergency-status)
+      (is-pool-contributor pool-id contributor)
+      (match withdrawal-info
+        existing (>= (- stacks-block-height (get last-withdrawal existing)) EMERGENCY-COOLDOWN-BLOCKS)
+        true
+      )
+    )
+  )
 )
 
 (define-public (create-pool (route (string-ascii 100)) (max-pool uint) (min-contribution uint) (max-contribution uint) (premium-rate uint))
@@ -550,5 +603,82 @@
     
     (map-set user-balances tx-sender (+ user-balance reduction-amount))
     (ok new-contribution)
+  )
+)
+
+(define-public (declare-emergency (pool-id uint) (reason (string-ascii 100)))
+  (let ((pool-info (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND)))
+    (asserts! (or (is-eq tx-sender (get creator pool-info)) (is-eq tx-sender (var-get contract-owner))) ERR-NOT-AUTHORIZED)
+    (asserts! (get active pool-info) ERR-NOT-AUTHORIZED)
+    
+    (map-set pool-emergency-status pool-id {
+      is-emergency: true,
+      declared-at: stacks-block-height,
+      declared-by: tx-sender,
+      reason: reason
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-emergency (pool-id uint))
+  (let ((pool-info (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+        (emergency-status (get-pool-emergency-status pool-id)))
+    (asserts! (or (is-eq tx-sender (get creator pool-info)) (is-eq tx-sender (var-get contract-owner))) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-emergency emergency-status) ERR-POOL-NOT-IN-EMERGENCY)
+    
+    (map-set pool-emergency-status pool-id (merge emergency-status {
+      is-emergency: false
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw (pool-id uint))
+  (let ((pool-info (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+        (emergency-status (get-pool-emergency-status pool-id))
+        (contributor-info (unwrap! (map-get? pool-contributors {pool-id: pool-id, contributor: tx-sender}) ERR-NOT-CONTRIBUTOR))
+        (contribution-amount (get amount contributor-info))
+        (penalty-amount (/ (* contribution-amount EMERGENCY-WITHDRAWAL-PENALTY) u10000))
+        (withdrawal-amount (- contribution-amount penalty-amount))
+        (user-balance (get-user-balance tx-sender))
+        (existing-withdrawal (map-get? emergency-withdrawals {pool-id: pool-id, contributor: tx-sender})))
+    
+    (asserts! (get is-emergency emergency-status) ERR-POOL-NOT-IN-EMERGENCY)
+    (asserts! (> contribution-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (match existing-withdrawal
+      existing (>= (- stacks-block-height (get last-withdrawal existing)) EMERGENCY-COOLDOWN-BLOCKS)
+      true
+    ) ERR-EMERGENCY-COOLDOWN)
+    
+    (map-delete pool-contributors {pool-id: pool-id, contributor: tx-sender})
+    
+    (map-set pools pool-id (merge pool-info {
+      total-pool: (- (get total-pool pool-info) contribution-amount)
+    }))
+    
+    (map-set user-balances tx-sender (+ user-balance withdrawal-amount))
+    
+    (let ((owner-balance (get-user-balance (var-get contract-owner))))
+      (map-set user-balances (var-get contract-owner) (+ owner-balance penalty-amount))
+    )
+    
+    (match existing-withdrawal
+      existing
+        (map-set emergency-withdrawals {pool-id: pool-id, contributor: tx-sender} {
+          last-withdrawal: stacks-block-height,
+          total-withdrawn: (+ (get total-withdrawn existing) withdrawal-amount),
+          penalty-paid: (+ (get penalty-paid existing) penalty-amount)
+        })
+      (map-set emergency-withdrawals {pool-id: pool-id, contributor: tx-sender} {
+        last-withdrawal: stacks-block-height,
+        total-withdrawn: withdrawal-amount,
+        penalty-paid: penalty-amount
+      })
+    )
+    
+    (ok {withdrawn: withdrawal-amount, penalty: penalty-amount})
   )
 )
